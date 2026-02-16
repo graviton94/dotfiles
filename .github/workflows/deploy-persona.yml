@@ -1,0 +1,68 @@
+name: "Agent: Deploy Karpathy Persona"
+
+# 1. 발주서(Trigger): 사용자가 버튼을 누르거나 API를 호출할 때만 작동
+on:
+  workflow_dispatch:
+    inputs:
+      commit_message:
+        description: 'Commit message for the update'
+        required: true
+        default: 'chore: update global copilot instructions via Agent'
+
+jobs:
+  inject-persona:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🔍 Checkout Dotfiles (Central Command)
+        uses: actions/checkout@v4
+
+      - name: 🤖 Run Injection Agent
+        env:
+          # GitHub의 특수 권한 토큰 사용 (자신의 모든 레포 접근용)
+          GH_TOKEN: ${{ secrets.GH_PAT }} 
+        run: |
+          # 1. 마스터 페르소나 로드
+          MASTER_FILE=".github/copilot-instructions.md"
+          
+          if [ ! -f "$MASTER_FILE" ]; then
+            echo "❌ Error: Master instructions not found in dotfiles!"
+            exit 1
+          fi
+          
+          CONTENT=$(cat $MASTER_FILE)
+          echo "✅ Master Persona Loaded. Target: All Repositories"
+
+          # 2. 사용자(graviton94)의 모든 리포지토리 조회 (최대 1000개)
+          # (Fork된 레포 제외, 소스 레포만 대상)
+          gh repo list --source --limit 1000 --json name --jq '.[].name' | while read -r repo; do
+            echo "---------------------------------------------------"
+            echo "🎯 Targeting: $repo"
+            
+            # 3. 각 레포지토리의 기존 파일 검사 (API 사용)
+            EXISTING=$(gh api "/repos/${GITHUB_REPOSITORY_OWNER}/$repo/contents/.github/copilot-instructions.md" --jq .content 2>/dev/null | base64 -d 2>/dev/null)
+            
+            # 4. 스마트 병합 로직 (충돌 방지)
+            if [ -z "$EXISTING" ]; then
+              echo "   -> Status: New File. Injecting..."
+              FINAL_CONTENT="$CONTENT"
+            elif echo "$EXISTING" | grep -q "KARPATHY_CORE_GLOBAL"; then
+              echo "   -> Status: Already Updated. Skipping."
+              continue
+            else
+              echo "   -> Status: Merging with existing rules."
+              FINAL_CONTENT="$CONTENT"$'\n\n'"$EXISTING"
+            fi
+
+            # 5. GitHub API로 파일 직접 커밋 (로컬 클론 X, 서버에서 즉시 처리)
+            gh api --method PUT "/repos/${GITHUB_REPOSITORY_OWNER}/$repo/contents/.github/copilot-instructions.md" \
+              -f message="${{ inputs.commit_message }}" \
+              -f content="$(echo "$FINAL_CONTENT" | base64 -w 0)" \
+              -f branch="main" \
+              --silent
+              
+            if [ $? -eq 0 ]; then
+              echo "   ✅ Success: Instructions deployed."
+            else
+              echo "   ⚠️ Warning: Failed (Check branch protection or permissions)."
+            fi
+          done
