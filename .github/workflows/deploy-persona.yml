@@ -1,6 +1,5 @@
 name: "Agent: Deploy Karpathy Persona"
 
-# 1. 발주서(Trigger): 사용자가 버튼을 누르거나 API를 호출할 때만 작동
 on:
   workflow_dispatch:
     inputs:
@@ -12,57 +11,64 @@ on:
 jobs:
   inject-persona:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - name: 🔍 Checkout Dotfiles (Central Command)
+      - name: Checkout Dotfiles
         uses: actions/checkout@v4
 
-      - name: 🤖 Run Injection Agent
+      - name: Run Injection Agent
         env:
-          # GitHub의 특수 권한 토큰 사용 (자신의 모든 레포 접근용)
-          GH_TOKEN: ${{ secrets.GH_PAT }} 
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          # 1. 마스터 페르소나 로드
+          # [CRITICAL] 오류가 발생해도 멈추지 않도록 설정
+          set +e
+          
           MASTER_FILE=".github/copilot-instructions.md"
           
           if [ ! -f "$MASTER_FILE" ]; then
-            echo "❌ Error: Master instructions not found in dotfiles!"
+            echo "❌ Error: Master instructions not found!"
             exit 1
           fi
           
           CONTENT=$(cat $MASTER_FILE)
-          echo "✅ Master Persona Loaded. Target: All Repositories"
+          echo "✅ Master Persona Loaded."
 
-          # 2. 사용자(graviton94)의 모든 리포지토리 조회 (최대 1000개)
-          # (Fork된 레포 제외, 소스 레포만 대상)
+          # 레포지토리 목록 순회
           gh repo list --source --limit 1000 --json name --jq '.[].name' | while read -r repo; do
             echo "---------------------------------------------------"
             echo "🎯 Targeting: $repo"
             
-            # 3. 각 레포지토리의 기존 파일 검사 (API 사용)
+            # 1. 기존 파일 확인 (실패 시 빈 문자열 처리)
             EXISTING=$(gh api "/repos/${GITHUB_REPOSITORY_OWNER}/$repo/contents/.github/copilot-instructions.md" --jq .content 2>/dev/null | base64 -d 2>/dev/null)
             
-            # 4. 스마트 병합 로직 (충돌 방지)
+            # 2. 내용 병합 로직
             if [ -z "$EXISTING" ]; then
-              echo "   -> Status: New File. Injecting..."
+              echo "   -> Status: New File."
               FINAL_CONTENT="$CONTENT"
+              MODE="Create"
             elif echo "$EXISTING" | grep -q "KARPATHY_CORE_GLOBAL"; then
               echo "   -> Status: Already Updated. Skipping."
               continue
             else
-              echo "   -> Status: Merging with existing rules."
+              echo "   -> Status: Merging."
               FINAL_CONTENT="$CONTENT"$'\n\n'"$EXISTING"
+              MODE="Update"
             fi
 
-            # 5. GitHub API로 파일 직접 커밋 (로컬 클론 X, 서버에서 즉시 처리)
+            # 3. GitHub API로 커밋 (오류 발생 시 로그 출력하고 계속 진행)
+            # --silent 옵션을 제거하여 오류 원인 확인
             gh api --method PUT "/repos/${GITHUB_REPOSITORY_OWNER}/$repo/contents/.github/copilot-instructions.md" \
               -f message="${{ inputs.commit_message }}" \
               -f content="$(echo "$FINAL_CONTENT" | base64 -w 0)" \
-              -f branch="main" \
-              --silent
+              -f branch="main" 2>&1
               
-            if [ $? -eq 0 ]; then
-              echo "   ✅ Success: Instructions deployed."
+            EXIT_CODE=$?
+            
+            if [ $EXIT_CODE -eq 0 ]; then
+              echo "   ✅ Success: $repo updated."
             else
-              echo "   ⚠️ Warning: Failed (Check branch protection or permissions)."
+              echo "   ⚠️ Failed: Could not update $repo (Exit Code: $EXIT_CODE)"
+              echo "      (Check: Branch protection? Archived? Empty repo?)"
             fi
           done
