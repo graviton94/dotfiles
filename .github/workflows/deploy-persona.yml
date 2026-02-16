@@ -1,74 +1,97 @@
-name: "Agent: Deploy Karpathy Persona"
+name: "Agent: Deploy Karpathy (Auto-PR Mode)"
 
 on:
   workflow_dispatch:
     inputs:
       commit_message:
-        description: 'Commit message for the update'
+        description: 'Commit message'
         required: true
-        default: 'chore: update global copilot instructions via Agent'
+        default: 'chore: enforce Karpathy persona (Global)'
 
 jobs:
-  inject-persona:
+  deploy-agent:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
+      pull-requests: write
     steps:
-      - name: Checkout Dotfiles
+      - name: Checkout Central Command
         uses: actions/checkout@v4
 
-      - name: Run Injection Agent
+      - name: 🤖 Run Intelligent Agent
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
+          MASTER_PATH: ".github/copilot-instructions.md"
         run: |
-          # [CRITICAL] 오류가 발생해도 멈추지 않도록 설정
+          # [CRITICAL] 에러가 나도 스크립트가 멈추지 않도록 설정
           set +e
           
-          MASTER_FILE=".github/copilot-instructions.md"
-          
-          if [ ! -f "$MASTER_FILE" ]; then
-            echo "❌ Error: Master instructions not found!"
+          echo "🔍 [Check] Verifying Master Persona..."
+          if [ ! -f "$MASTER_PATH" ]; then
+            echo "❌ FATAL: Master file ($MASTER_PATH) still missing in dotfiles!"
+            echo "👉 Please complete Step 1: Create .github/copilot-instructions.md first."
             exit 1
           fi
           
-          CONTENT=$(cat $MASTER_FILE)
-          echo "✅ Master Persona Loaded."
+          CONTENT=$(cat $MASTER_PATH)
+          echo "✅ Master Persona Loaded. Ready to Deploy."
 
-          # 레포지토리 목록 순회
-          gh repo list --source --limit 1000 --json name --jq '.[].name' | while read -r repo; do
+          echo "🚀 [Start] Global Deployment Loop..."
+          
+          # 모든 리포지토리 순회 (최대 1000개)
+          gh repo list --source --limit 1000 --json name,defaultBranchRef --jq '.[] | "\(.name) \(.defaultBranchRef.name)"' | while read -r repo branch; do
             echo "---------------------------------------------------"
-            echo "🎯 Targeting: $repo"
+            echo "🎯 Target: $repo (Branch: $branch)"
             
-            # 1. 기존 파일 확인 (실패 시 빈 문자열 처리)
+            # 1. 기존 파일 확인
             EXISTING=$(gh api "/repos/${GITHUB_REPOSITORY_OWNER}/$repo/contents/.github/copilot-instructions.md" --jq .content 2>/dev/null | base64 -d 2>/dev/null)
             
-            # 2. 내용 병합 로직
             if [ -z "$EXISTING" ]; then
-              echo "   -> Status: New File."
               FINAL_CONTENT="$CONTENT"
               MODE="Create"
             elif echo "$EXISTING" | grep -q "KARPATHY_CORE_GLOBAL"; then
-              echo "   -> Status: Already Updated. Skipping."
+              echo "   ✅ Already up to date. Skipping."
               continue
             else
-              echo "   -> Status: Merging."
               FINAL_CONTENT="$CONTENT"$'\n\n'"$EXISTING"
               MODE="Update"
             fi
-
-            # 3. GitHub API로 커밋 (오류 발생 시 로그 출력하고 계속 진행)
-            # --silent 옵션을 제거하여 오류 원인 확인
-            gh api --method PUT "/repos/${GITHUB_REPOSITORY_OWNER}/$repo/contents/.github/copilot-instructions.md" \
-              -f message="${{ inputs.commit_message }}" \
-              -f content="$(echo "$FINAL_CONTENT" | base64 -w 0)" \
-              -f branch="main" 2>&1
-              
-            EXIT_CODE=$?
             
-            if [ $EXIT_CODE -eq 0 ]; then
-              echo "   ✅ Success: $repo updated."
+            B64_CONTENT=$(echo "$FINAL_CONTENT" | base64 -w 0)
+
+            # 2. [시도 A] 직접 푸시 (Direct Push)
+            echo "   Trying Direct Push..."
+            OUTPUT=$(gh api --method PUT "/repos/${GITHUB_REPOSITORY_OWNER}/$repo/contents/.github/copilot-instructions.md" \
+              -f message="${{ inputs.commit_message }}" \
+              -f content="$B64_CONTENT" \
+              -f branch="$branch" 2>&1)
+            
+            if [ $? -eq 0 ]; then
+              echo "   ✅ Success: Direct Push completed."
+              continue
+            fi
+
+            # 3. [시도 B] 실패(403/Protected) 시 PR 생성 (Auto-PR)
+            echo "   ⚠️ Direct Push Failed. Switching to Auto-PR mode..."
+            
+            PR_BRANCH="chore/update-karpathy-persona-$(date +%s)"
+            SHA_BASE=$(gh api "/repos/${GITHUB_REPOSITORY_OWNER}/$repo/git/ref/heads/$branch" --jq .object.sha)
+            
+            # 브랜치 생성 -> 파일 푸시 -> PR 생성 순차 진행
+            gh api --method POST "/repos/${GITHUB_REPOSITORY_OWNER}/$repo/git/refs" -f ref="refs/heads/$PR_BRANCH" -f sha="$SHA_BASE" --silent
+            
+            FILE_SHA=$(gh api "/repos/${GITHUB_REPOSITORY_OWNER}/$repo/contents/.github/copilot-instructions.md" --jq .sha 2>/dev/null)
+            if [ -n "$FILE_SHA" ]; then
+               gh api --method PUT "/repos/${GITHUB_REPOSITORY_OWNER}/$repo/contents/.github/copilot-instructions.md" -f message="${{ inputs.commit_message }}" -f content="$B64_CONTENT" -f branch="$PR_BRANCH" -f sha="$FILE_SHA" --silent
             else
-              echo "   ⚠️ Failed: Could not update $repo (Exit Code: $EXIT_CODE)"
-              echo "      (Check: Branch protection? Archived? Empty repo?)"
+               gh api --method PUT "/repos/${GITHUB_REPOSITORY_OWNER}/$repo/contents/.github/copilot-instructions.md" -f message="${{ inputs.commit_message }}" -f content="$B64_CONTENT" -f branch="$PR_BRANCH" --silent
+            fi
+            
+            gh api --method POST "/repos/${GITHUB_REPOSITORY_OWNER}/$repo/pulls" -f title="🤖 AI: Enforce Karpathy Persona" -f body="Automated PR to inject global Karpathy guidelines." -f head="$PR_BRANCH" -f base="$branch" --silent
+              
+            if [ $? -eq 0 ]; then
+              echo "   ✅ Success: Pull Request Created."
+            else
+              echo "   ❌ FATAL: PR creation failed. Check permissions."
             fi
           done
